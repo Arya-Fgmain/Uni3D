@@ -15,11 +15,26 @@ MESH_SUFFIXES = {".obj", ".glb", ".gltf"}
 def parse_args():
     p = argparse.ArgumentParser("Category-level Uni3D FPD for real vs generated meshes")
 
-    p.add_argument("--real-dir", required=True, help="Folder of real .glb/.gltf/.obj meshes")
-    p.add_argument("--generated-dir", required=True, help="Folder of generated .glb/.gltf/.obj meshes")
-    p.add_argument("--out-csv", default="uni3d_category_fpd.csv")
+    p.add_argument(
+        "--real-dir",
+        type=Path,
+        required=True,
+        help="Folder of real .glb/.gltf/.obj meshes",
+    )
+    p.add_argument(
+        "--generated-dir",
+        type=Path,
+        required=True,
+        help="Folder of generated .glb/.gltf/.obj meshes",
+    )
+    p.add_argument("--out-csv", type=Path, default=Path("uni3d_category_fpd.csv"))
 
-    p.add_argument("--ckpt", required=True, help="Path to Uni3D model.pt checkpoint")
+    p.add_argument(
+        "--ckpt",
+        type=Path,
+        required=True,
+        help="Path to Uni3D model.pt checkpoint",
+    )
     p.add_argument("--scale", default="base", choices=["tiny", "small", "base", "large", "giant"])
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", default=None, help="cuda, cuda:0, or cpu")
@@ -29,7 +44,14 @@ def parse_args():
     p.add_argument("--seed", type=int, default=None)
 
     p.add_argument("--no-l2-normalize", action="store_true")
-    p.add_argument("--no-xyz-normalize", action="store_true")
+    p.add_argument(
+        "--no-xyz-normalize",
+        action="store_true",
+        help=(
+            "Disable the default per-cloud centering and unit-sphere scaling. "
+            "Not recommended when comparing generators with different coordinates."
+        ),
+    )
 
     p.add_argument(
         "--categories",
@@ -41,22 +63,34 @@ def parse_args():
     return p.parse_args()
 
 
-def category_from_name(path):
+def category_from_path(path, root):
     # dishwasher.3dc200....glb -> dishwasher
     # tabletop_clock.fpModel....glb -> tabletop_clock
-    return path.name.split(".")[0]
+    if "." in path.stem:
+        return path.stem.split(".", 1)[0]
+
+    # Older SpaceControl output trees use generic names such as generated.glb:
+    # <object-id>/<run-name>/generated.glb. Find the nearest ancestor that
+    # carries the original dotted object ID.
+    relative = path.relative_to(root)
+    for parent_name in reversed(relative.parts[:-1]):
+        if "." in parent_name:
+            return parent_name.split(".", 1)[0]
+
+    return path.stem
 
 
 def collect_by_category(root):
+    root = Path(root).expanduser().resolve()
     groups = defaultdict(list)
 
-    for path in sorted(Path(root).rglob("*")):
+    for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         if path.suffix.lower() not in MESH_SUFFIXES:
             continue
 
-        category = category_from_name(path)
+        category = category_from_path(path, root)
         groups[category].append(path)
 
     return dict(groups)
@@ -233,6 +267,21 @@ def calculate_score(calculate_fpd_uni3d, generated, reference, args, torch):
 def main():
     args = parse_args()
 
+    args.real_dir = args.real_dir.expanduser().resolve()
+    args.generated_dir = args.generated_dir.expanduser().resolve()
+    args.ckpt = args.ckpt.expanduser().resolve()
+    args.out_csv = args.out_csv.expanduser()
+
+    for label, path in (
+        ("real directory", args.real_dir),
+        ("generated directory", args.generated_dir),
+    ):
+        if not path.is_dir():
+            raise SystemExit(f"ERROR: {label} does not exist: {path}")
+
+    if not args.ckpt.is_file():
+        raise SystemExit(f"ERROR: checkpoint does not exist: {args.ckpt}")
+
     import torch
     from FPD import calculate_fpd_uni3d
 
@@ -251,6 +300,10 @@ def main():
 
     print(f"Found real categories: {sorted(real_groups)}")
     print(f"Found generated categories: {sorted(gen_groups)}")
+    print(
+        "XYZ normalization:",
+        "disabled" if args.no_xyz_normalize else "centered unit sphere",
+    )
 
     for category in categories:
         real_paths = real_groups.get(category, [])
@@ -309,7 +362,7 @@ def main():
             }
         )
 
-    out_csv = Path(args.out_csv)
+    out_csv = args.out_csv
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     with open(out_csv, "w", newline="") as f:
