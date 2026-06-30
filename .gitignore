@@ -6,3 +6,7 @@ open_clip/*
 dsconfig/*
 .vscode/*
 dsconfig/*
+.DS_Store
+Pointnet2_PyTorch/
+results_initial/
+uni3d_fpd_*results.csv
