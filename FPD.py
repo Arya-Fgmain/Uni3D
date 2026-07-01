@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from scipy.linalg import sqrtm
 
 try:
     from pointnet import PointNetCls
@@ -255,26 +254,30 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
     diff = mu1 - mu2
 
-    # Product might be almost singular
-    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
-    if not np.isfinite(covmean).all():
-        msg = ('fid calculation produces singular product; '
-               'adding %s to diagonal of cov estimates') % eps
-        print(msg)
-        offset = np.eye(sigma1.shape[0]) * eps
-        covmean = sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    # Covariances are rank deficient when a category has fewer samples than
+    # embedding dimensions.  sqrtm(sigma1 @ sigma2) is then numerically
+    # unstable because the product is not symmetric and may acquire enormous
+    # imaginary components.  Use the equivalent PSD expression:
+    # Tr(sqrt(sqrt(sigma1) @ sigma2 @ sqrt(sigma1))).
+    sigma1 = (sigma1 + sigma1.T) * 0.5
+    sigma2 = (sigma2 + sigma2.T) * 0.5
+    eigenvalues1, eigenvectors1 = np.linalg.eigh(sigma1)
+    eigenvalues1 = np.clip(eigenvalues1, 0.0, None)
+    sqrt_sigma1 = (
+        eigenvectors1 * np.sqrt(eigenvalues1)
+    ).dot(eigenvectors1.T)
+    covariance_product = sqrt_sigma1.dot(sigma2).dot(sqrt_sigma1)
+    covariance_product = (covariance_product + covariance_product.T) * 0.5
+    product_eigenvalues = np.linalg.eigvalsh(covariance_product)
+    tr_covmean = np.sqrt(np.clip(product_eigenvalues, 0.0, None)).sum()
 
-    # Numerical error might give slight imaginary component
-    if np.iscomplexobj(covmean):
-        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-            m = np.max(np.abs(covmean.imag))
-            raise ValueError('Imaginary component {}'.format(m))
-        covmean = covmean.real
-
-    tr_covmean = np.trace(covmean)
-
-    return (diff.dot(diff) + np.trace(sigma1) +
-            np.trace(sigma2) - 2 * tr_covmean)
+    distance = (
+        diff.dot(diff)
+        + np.trace(sigma1)
+        + np.trace(sigma2)
+        - 2 * tr_covmean
+    )
+    return float(max(distance, 0.0))
 
 
 def calculate_activation_statistics(pointclouds, model, batch_size=100,
