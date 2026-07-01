@@ -4,12 +4,17 @@ import argparse
 import csv
 import sys
 from collections import defaultdict
+from itertools import permutations, product
 from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 MESH_SUFFIXES = {".obj", ".glb", ".gltf"}
+GENERIC_GENERATION_STEMS = {"generated", "mesh", "output"}
 
 
 def parse_args():
@@ -42,6 +47,23 @@ def parse_args():
     p.add_argument("--points-per-cloud", type=int, default=10000)
     p.add_argument("--mesh-clouds-per-file", type=int, default=1)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument(
+        "--no-align",
+        action="store_true",
+        help="Do not rotationally align generated meshes to their references.",
+    )
+    p.add_argument(
+        "--alignment-points",
+        type=int,
+        default=2048,
+        help="Maximum sampled points used to estimate rotational alignment",
+    )
+    p.add_argument(
+        "--alignment-iterations",
+        type=int,
+        default=20,
+        help="ICP refinement iterations for each candidate rotation",
+    )
 
     p.add_argument("--no-l2-normalize", action="store_true")
     p.add_argument(
@@ -94,6 +116,31 @@ def collect_by_category(root):
         groups[category].append(path)
 
     return dict(groups)
+
+
+def reference_index(root):
+    index = {}
+    for paths in collect_by_category(root).values():
+        for path in paths:
+            if path.stem in index:
+                raise ValueError(f"duplicate reference object ID: {path.stem}")
+            index[path.stem] = path
+    return index
+
+
+def object_id_from_generation(path, generated_root):
+    stem = path.stem
+    if "_sample_" in stem:
+        return stem.split("_sample_", 1)[0]
+    if stem not in GENERIC_GENERATION_STEMS and "." in stem:
+        return stem
+
+    relative = path.relative_to(generated_root)
+    for parent_name in reversed(relative.parts[:-1]):
+        if "." in parent_name:
+            return parent_name
+
+    raise ValueError(f"cannot infer object ID from generated path: {path}")
 
 
 def _parse_obj_vertex_index(token, num_vertices):
@@ -250,6 +297,168 @@ def load_distribution(paths, points_per_cloud, mesh_clouds_per_file):
     return torch.cat(clouds, dim=0)
 
 
+def proper_axis_rotations():
+    rotations = []
+    for permutation in permutations(range(3)):
+        permutation_matrix = np.eye(3)[:, permutation]
+        for signs in product((-1.0, 1.0), repeat=3):
+            rotation = permutation_matrix @ np.diag(signs)
+            if np.linalg.det(rotation) > 0.0:
+                rotations.append(rotation)
+    return rotations
+
+
+AXIS_ROTATIONS = proper_axis_rotations()
+
+
+def squared_chamfer_clouds(cloud_a, cloud_b):
+    tree_a = cKDTree(cloud_a)
+    tree_b = cKDTree(cloud_b)
+    distance_b_to_a, _ = tree_a.query(cloud_b)
+    distance_a_to_b, _ = tree_b.query(cloud_a)
+    return float(
+        np.mean(np.square(distance_b_to_a))
+        + np.mean(np.square(distance_a_to_b))
+    )
+
+
+def kabsch_rotation(source, target):
+    covariance = source.T @ target
+    u_matrix, _, v_transpose = np.linalg.svd(covariance)
+    rotation = u_matrix @ v_transpose
+    if np.linalg.det(rotation) < 0.0:
+        u_matrix[:, -1] *= -1.0
+        rotation = u_matrix @ v_transpose
+    return rotation
+
+
+def estimate_rotation(source, target, max_points=2048, iterations=20):
+    point_count = min(len(source), len(target), max_points)
+    if point_count < 3:
+        raise ValueError("at least three points are required for alignment")
+
+    source_indices = np.linspace(
+        0,
+        len(source) - 1,
+        point_count,
+        dtype=np.int64,
+    )
+    target_indices = np.linspace(
+        0,
+        len(target) - 1,
+        point_count,
+        dtype=np.int64,
+    )
+    source_small = source[source_indices]
+    target_small = target[target_indices]
+    source_small = source_small - source_small.mean(axis=0)
+    target_small = target_small - target_small.mean(axis=0)
+    target_tree = cKDTree(target_small)
+
+    candidates = sorted(
+        [
+            (
+                squared_chamfer_clouds(
+                    target_small,
+                    source_small @ rotation,
+                ),
+                rotation,
+            )
+            for rotation in AXIS_ROTATIONS
+        ],
+        key=lambda candidate: candidate[0],
+    )[:4]
+
+    best_score = np.inf
+    best_rotation = np.eye(3)
+
+    for _, initial_rotation in candidates:
+        transformed = source_small @ initial_rotation
+        total_rotation = initial_rotation.copy()
+        previous_error = np.inf
+
+        for _ in range(iterations):
+            distances, indices = target_tree.query(transformed)
+            matched_target = target_small[indices]
+            source_center = transformed.mean(axis=0)
+            target_center = matched_target.mean(axis=0)
+            delta_rotation = kabsch_rotation(
+                transformed - source_center,
+                matched_target - target_center,
+            )
+            transformed = (
+                (transformed - source_center) @ delta_rotation
+                + target_center
+            )
+            total_rotation = total_rotation @ delta_rotation
+
+            error = float(np.mean(np.square(distances)))
+            if abs(previous_error - error) <= 1e-9:
+                break
+            previous_error = error
+
+        transformed = transformed - transformed.mean(axis=0)
+        score = squared_chamfer_clouds(target_small, transformed)
+        if score < best_score:
+            best_score = score
+            best_rotation = total_rotation
+
+    return best_rotation
+
+
+def load_aligned_distribution(
+    generated_paths,
+    generated_root,
+    references,
+    points_per_cloud,
+    mesh_clouds_per_file,
+    alignment_points,
+    alignment_iterations,
+):
+    import torch
+
+    aligned_clouds = []
+    for generated_path in generated_paths:
+        object_id = object_id_from_generation(
+            generated_path,
+            generated_root,
+        )
+        reference_path = references.get(object_id)
+        if reference_path is None:
+            raise FileNotFoundError(
+                f"no reference mesh found for object ID: {object_id}"
+            )
+
+        generated = sample_mesh_surface(
+            generated_path,
+            points_per_cloud,
+            mesh_clouds_per_file,
+        )
+        reference = sample_mesh_surface(
+            reference_path,
+            points_per_cloud,
+            mesh_clouds_per_file,
+        )
+
+        for generated_cloud, reference_cloud in zip(generated, reference):
+            generated_numpy = generated_cloud.numpy()
+            reference_numpy = reference_cloud.numpy()
+            rotation = estimate_rotation(
+                generated_numpy,
+                reference_numpy,
+                max_points=alignment_points,
+                iterations=alignment_iterations,
+            )
+            rotation = torch.tensor(rotation, dtype=generated_cloud.dtype)
+            aligned = (
+                (generated_cloud - generated_cloud.mean(dim=0)) @ rotation
+                + reference_cloud.mean(dim=0)
+            )
+            aligned_clouds.append(aligned)
+
+    return torch.stack(aligned_clouds, dim=0)
+
+
 def calculate_score(calculate_fpd_uni3d, generated, reference, args, torch):
     return calculate_fpd_uni3d(
         generated,
@@ -290,6 +499,7 @@ def main():
 
     real_groups = collect_by_category(args.real_dir)
     gen_groups = collect_by_category(args.generated_dir)
+    references = reference_index(args.real_dir)
 
     categories = sorted(set(real_groups) | set(gen_groups))
 
@@ -304,6 +514,7 @@ def main():
         "XYZ normalization:",
         "disabled" if args.no_xyz_normalize else "centered unit sphere",
     )
+    print("Rotational alignment:", "disabled" if args.no_align else "ICP")
 
     for category in categories:
         real_paths = real_groups.get(category, [])
@@ -328,11 +539,22 @@ def main():
                     args.mesh_clouds_per_file,
                 )
 
-                generated = load_distribution(
-                    gen_paths,
-                    args.points_per_cloud,
-                    args.mesh_clouds_per_file,
-                )
+                if args.no_align:
+                    generated = load_distribution(
+                        gen_paths,
+                        args.points_per_cloud,
+                        args.mesh_clouds_per_file,
+                    )
+                else:
+                    generated = load_aligned_distribution(
+                        gen_paths,
+                        args.generated_dir,
+                        references,
+                        args.points_per_cloud,
+                        args.mesh_clouds_per_file,
+                        args.alignment_points,
+                        args.alignment_iterations,
+                    )
 
                 score = calculate_score(
                     calculate_fpd_uni3d,

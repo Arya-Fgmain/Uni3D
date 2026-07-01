@@ -5,3 +5,4 @@
  easydict 
  h5py 
  ninja
+ trimesh
